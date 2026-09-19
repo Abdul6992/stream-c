@@ -11,6 +11,8 @@ jobs:
     timeout-minutes: 355
     env:
       NEXT_REPO: Abdul6992/stream-a
+      STREAM_SECS: 1200   # test: 20 min | asli: 19200 (5h20m)
+      PRE_SECS: 600       # agle repo ko end se 10 min pehle trigger
     steps:
       - name: Install ffmpeg and gdown
         run: |
@@ -22,16 +24,25 @@ jobs:
           gdown "https://drive.google.com/uc?id=${{ secrets.DRIVE_FILE_ID }}" -O video.mp4
           ls -lh video.mp4
 
-      - name: Stream with resume offset
+      - name: Wait for slot and stream
         run: |
+          NOW=$(date +%s)
           T0="${{ github.event.client_payload.t0 }}"
-          if [ -z "$T0" ]; then T0=$(date +%s); fi
+          P="${{ github.event.client_payload.start_at }}"
+          if [ -z "$T0" ]; then T0=$NOW; fi
+          if [ -z "$P" ]; then P=$NOW; fi
+
+          # planned start tak intezar
+          WAIT=$(( P - $(date +%s) ))
+          if [ $WAIT -gt 0 ]; then echo "Waiting ${WAIT}s for start slot"; sleep $WAIT; fi
 
           DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 video.mp4 | cut -d. -f1)
           OFFSET=$(( ( $(date +%s) - T0 ) % DUR ))
-          echo "Duration=$DUR  Offset=$OFFSET"
+          END=$(( P + STREAM_SECS ))
+          TRIGGER_AT=$(( END - PRE_SECS ))
+          echo "Duration=$DUR  Offset=$OFFSET  PlannedStart=$P  End=$END"
 
-          REPEATS=$(( 19800 / DUR + 2 ))
+          REPEATS=$(( STREAM_SECS / DUR + 2 ))
           {
             echo "ffconcat version 1.0"
             echo "file 'video.mp4'"
@@ -39,13 +50,19 @@ jobs:
             for i in $(seq 1 $REPEATS); do echo "file 'video.mp4'"; done
           } > list.txt
 
-          (sleep 240 && curl -s -X POST \
-            -H "Authorization: Bearer ${{ secrets.PAT }}" \
-            -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/$NEXT_REPO/dispatches \
-            -d "{\"event_type\":\"start-stream\",\"client_payload\":{\"t0\":\"$T0\"}}") &
+          # agle repo ko end se PRE_SECS pehle trigger
+          (
+            D=$(( TRIGGER_AT - $(date +%s) ))
+            if [ $D -gt 0 ]; then sleep $D; fi
+            curl -s -o /dev/null -w "Trigger HTTP %{http_code}\n" -X POST \
+              -H "Authorization: Bearer ${{ secrets.PAT }}" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/$NEXT_REPO/dispatches \
+              -d "{\"event_type\":\"start-stream\",\"client_payload\":{\"t0\":\"$T0\",\"start_at\":\"$END\"}}"
+          ) &
 
-          timeout 300 ffmpeg -re -f concat -i list.txt \
+          LEFT=$(( END - $(date +%s) ))
+          timeout $LEFT ffmpeg -re -f concat -i list.txt \
             -c:v libx264 -preset veryfast -b:v 2500k -maxrate 2500k -bufsize 5000k \
             -g 60 -keyint_min 60 -pix_fmt yuv420p \
             -c:a aac -b:a 128k -ar 44100 \
